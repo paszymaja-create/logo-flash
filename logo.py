@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-FULL AUTO FLASH TOOL – ORNO MD-1080 (v2.2)
-Autor: Gemini & User
-Proces: Konwersja -> Przerwanie Boota -> Transfer YMODEM -> Flashowanie -> Logowanie
+STABLE AUTO FLASH – ORNO MD-1080
+Bez konfliktu portu z sb.
+DODANO: Tryb testowy (--test) do walidacji obrazu bez flashowania.
 """
 
 import os
@@ -14,164 +14,212 @@ import serial
 import subprocess
 from pathlib import Path
 
-# --- KONFIGURACJA URZĄDZENIA ---
-PARTITION_SIZE = 204800  # 200 KiB (dokładnie tyle ile ma partycja logo)
+# --- KONFIG ---
+PARTITION_SIZE = 204800
 TARGET_RES = (1024, 600)
-START_QUALITY = 85
-MIN_QUALITY = 50
-QUALITY_STEP = 5
 BAUDRATE = 115200
-LOG_FILE = "flash_log.txt"
-
-# Adresy U-Boot
+LOAD_ADDR = "0x82000000"
 FLASH_ADDR = "0x23b000"
 FLASH_SIZE = "0x32000"
-LOAD_ADDR = "0x82000000"
 
-def log(msg, to_file_only=False):
-    """Zapisuje wiadomość do logu i opcjonalnie wyświetla na ekranie."""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    formatted = f"[{timestamp}] {msg}"
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(formatted + "\n")
-    if not to_file_only:
-        print(msg)
+START_QUALITY = 85
+MIN_QUALITY = 60
+QUALITY_STEP = 5
+
+
+# ------------------------------------------------------------
+# DEPENDENCIES
+# ------------------------------------------------------------
 
 def check_dependencies():
-    """Sprawdza czy niezbędne narzędzia systemowe są zainstalowane."""
     for tool in ["convert", "sb"]:
         if not shutil.which(tool):
-            log(f"❌ BŁĄD: Brak narzędzia '{tool}'. Zainstaluj je: sudo apt install imagemagick lrzsz")
+            print(f"Brak narzędzia: {tool}")
             sys.exit(1)
 
-def prepare_image(input_path, output_path):
-    """Konwertuje obraz i dopasowuje jakość do rozmiaru partycji."""
-    quality = START_QUALITY
-    while quality >= MIN_QUALITY:
-        print(f"  > Próba konwersji (Jakość: {quality})...", end="\r")
-        try:
-            subprocess.run([
-                "convert", str(input_path),
-                "-resize", f"{TARGET_RES[0]}x{TARGET_RES[1]}",
-                "-background", "black",
-                "-gravity", "center",
-                "-extent", f"{TARGET_RES[0]}x{TARGET_RES[1]}",
-                "-strip", "-quality", str(quality),
-                str(output_path)
-            ], check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            log(f"❌ BŁĄD ImageMagick: {e.stderr.decode()}")
-            return False
 
-        size = os.path.getsize(output_path)
-        if size <= PARTITION_SIZE:
-            log(f"\n  ✅ Obraz gotowy: {size} bajtów (limit: {PARTITION_SIZE}, jakość: {quality})")
-            # Padding 0xFF do pełnego rozmiaru partycji
-            with open(output_path, "ab") as f:
-                f.write(b"\xFF" * (PARTITION_SIZE - size))
-            return True
-        quality -= QUALITY_STEP
-    
-    log("\n❌ BŁĄD: Obraz jest zbyt złożony, by zmieścić go w 200 KiB.")
-    return False
+# ------------------------------------------------------------
+# SERIAL
+# ------------------------------------------------------------
 
-def wait_for_uboot_and_interrupt(ser):
-    """Czeka na sygnał z U-Boot i wysyła klawisz przerwania."""
-    log("⏳ Czekam na U-Boot (zrestartuj teraz domofon)...")
-    start_time = time.time()
-    buffer = ""
-    while (time.time() - start_time) < 30: # 30 sekund timeoutu
+def detect_port():
+    ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+    if not ports:
+        print("Nie znaleziono portu USB.")
+        sys.exit(1)
+    print(f"Używam portu: {ports[0]}")
+    return ports[0]
+
+
+def wait_for(ser, text, timeout=5):
+    end = time.time() + timeout
+    buffer = b""
+
+    while time.time() < end:
         if ser.in_waiting:
-            chunk = ser.read(ser.in_waiting).decode(errors='ignore')
-            buffer += chunk
-            if "U-Boot" in buffer or "Hit any key" in buffer:
-                log("🚀 Wykryto start! Przerywam autoboot...")
-                for _ in range(15): # Seria enterów dla pewności
-                    ser.write(b"\n")
-                    time.sleep(0.05)
+            buffer += ser.read(ser.in_waiting)
+            if text.encode() in buffer:
                 return True
-        time.sleep(0.1)
+        time.sleep(0.05)
     return False
+
+
+def send_cmd(ser, cmd):
+    print(f"> {cmd}")
+    ser.write((cmd + "\n").encode())
+    time.sleep(0.3)
+
+
+def break_autoboot(ser):
+    print("Czekam na 'Hit any key'...")
+
+    if wait_for(ser, "Hit any key", timeout=5):
+        print("Przerywam autoboot...")
+        ser.write(b"\n")
+        time.sleep(0.5)
+
+        if wait_for(ser, "U-Boot", timeout=3):
+            print("Jesteśmy w konsoli U-Boot.")
+            return True
+
+    print("Nie udało się wejść do U-Boot.")
+    return False
+
+
+# ------------------------------------------------------------
+# IMAGE
+# ------------------------------------------------------------
+
+def convert_image(input_path, output_path, quality):
+    subprocess.run([
+        "convert",
+        input_path,
+        "-resize", f"{TARGET_RES[0]}x{TARGET_RES[1]}",
+        "-background", "black",
+        "-gravity", "center",
+        "-extent", f"{TARGET_RES[0]}x{TARGET_RES[1]}",
+        "-strip",
+        "-quality", str(quality),
+        output_path
+    ], check=True)
+
+
+def validate_jpeg(path):
+    with open(path, "rb") as f:
+        data = f.read()
+
+    if not data.startswith(b"\xFF\xD8"):
+        return False
+    if b"\xFF\xD9" not in data:
+        return False
+    return True
+
+
+def pad_to_size(path):
+    size = os.path.getsize(path)
+
+    if size > PARTITION_SIZE:
+        return False
+
+    if size < PARTITION_SIZE:
+        with open(path, "ab") as f:
+            f.write(b"\xFF" * (PARTITION_SIZE - size))
+
+    return True
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 
 def main():
     if len(sys.argv) < 2:
-        print("Użycie: python3 flash_logo_pro.py twoje_logo.jpg")
+        print("Użycie: python3 logo.py obraz.jpg [--test]")
         sys.exit(1)
 
-    # Inicjalizacja pliku logu
-    with open(LOG_FILE, "w") as f: f.write("--- NOWA SESJA FLASHOWANIA ---\n")
-    
     input_file = Path(sys.argv[1])
-    output_bin = Path("temp_logo.bin")
-    
+    is_test = "--test" in sys.argv
+
+    if not input_file.is_file():
+        print(f"Błąd: Plik '{input_file}' nie istnieje.")
+        sys.exit(1)
+
     check_dependencies()
     
-    log("--- ETAP 1: Przygotowanie obrazu ---")
-    if not prepare_image(input_file, output_bin):
-        sys.exit(1)
+    output_file = Path("logo_204800.jpg")
 
-    # Detekcja portu
-    ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
-    if not ports:
-        log("❌ BŁĄD: Nie znaleziono portu szeregowego USB.")
-        sys.exit(1)
-    port = ports[0]
-
-    log(f"--- ETAP 2: Połączenie ({port}) ---")
-    try:
-        ser = serial.Serial(port, BAUDRATE, timeout=1)
-    except Exception as e:
-        log(f"❌ BŁĄD: Nie można otworzyć portu {port}: {e}")
-        sys.exit(1)
-
-    if not wait_for_uboot_and_interrupt(ser):
-        log("❌ BŁĄD: Timeout. Nie wykryto konsoli U-Boot.")
-        sys.exit(1)
-
-    # Przygotowanie U-Boot do YMODEM
-    log("  > Wysyłam komendę loady...")
-    ser.write(f"loady {LOAD_ADDR}\n".encode())
-    time.sleep(1)
+    # --- KONWERSJA ---
+    quality = START_QUALITY
+    success = False
     
-    # KLUCZOWE: Zamknięcie portu dla zewnętrznego procesu 'sb'
-    ser.close()
+    while quality >= MIN_QUALITY:
+        print(f"Konwersja (jakość={quality})...")
+        convert_image(str(input_file), str(output_file), quality)
 
-    log("--- ETAP 3: Przesyłanie danych (YMODEM) ---")
-    try:
-        # Przekierowanie I/O bezpośrednio na port szeregowy
-        cmd = f"sb --ymodem {output_bin} < {port} > {port}"
-        subprocess.run(cmd, shell=True, check=True)
-        log("  ✅ Transfer zakończony pomyślnie.")
-    except subprocess.CalledProcessError:
-        log("❌ BŁĄD: Błąd przesyłania przez 'sb'!")
+        if os.path.getsize(output_file) <= PARTITION_SIZE:
+            success = True
+            break
+
+        quality -= QUALITY_STEP
+
+    if not success:
+        print(f"Błąd: Nie można zmieścić obrazu w limicie {PARTITION_SIZE} bajtów.")
         sys.exit(1)
 
-    # Powrót do kontroli przez Pythona
-    log("--- ETAP 4: Flashowanie ---")
-    ser.open()
+    if not validate_jpeg(output_file):
+        print("Błąd: Wygenerowany plik JPEG jest uszkodzony.")
+        sys.exit(1)
+
+    if not pad_to_size(output_file):
+        print("Błąd: Plik wynikowy przekroczył rozmiar partycji po paddingu.")
+        sys.exit(1)
+
+    print(f"Sukces! Plik przygotowany: {output_file} ({os.path.getsize(output_file)} bajtów)")
+
+    # --- TRYB TESTOWY ---
+    if is_test:
+        print("\n[TRYB TESTOWY] Konwersja zakończona pomyślnie. Pomijam flashowanie przez port szeregowy. ✅")
+        return
+
+    # --- FLASHOWANIE (TYLKO JEŚLI NIE TEST) ---
+    port = detect_port()
+    ser = serial.Serial(port, BAUDRATE, timeout=1)
+
+    if not break_autoboot(ser):
+        print("Błąd: Nie udało się przerwać bootowania. Zresetuj urządzenie i spróbuj ponownie.")
+        ser.close()
+        sys.exit(1)
+
+    send_cmd(ser, f"loady {LOAD_ADDR}")
+
+    print("Zamykam port do transferu YMODEM...")
+    ser.close()
+    time.sleep(0.5)
+
+    # --- YMODEM ---
+    print("Start transferu YMODEM (sb)...")
+    subprocess.run(
+        f"sb {output_file} < {port} > {port}",
+        shell=True,
+        check=True
+    )
+
+    # --- OTWIERAMY PONOWNIE ---
     time.sleep(1)
+    ser = serial.Serial(port, BAUDRATE, timeout=1)
 
-    flash_commands = [
-        ("sf probe", "Inicjalizacja Flash"),
-        (f"sf erase {FLASH_ADDR} +{FLASH_SIZE}", "Kasowanie partycji"),
-        (f"sf write {LOAD_ADDR} {FLASH_ADDR} $filesize", "Zapisywanie nowego logo"),
-        ("reset", "Restart urządzenia")
-    ]
+    print("Czekam na potwierdzenie rozmiaru transferu...")
+    wait_for(ser, "## Total Size", timeout=20)
 
-    for cmd, desc in flash_commands:
-        log(f"  > {desc} ({cmd})...")
-        ser.write(f"{cmd}\n".encode())
-        time.sleep(1)
-        # Odczyt odpowiedzi i zapis do logu
-        if ser.in_waiting:
-            resp = ser.read(ser.in_waiting).decode(errors='ignore')
-            log(f"[U-BOOT RESP]: {resp.strip()}", to_file_only=True)
-            if "fail" in resp.lower() or "error" in resp.lower():
-                log(f"⚠️ OSTRZEŻENIE: U-Boot zgłosił błąd podczas: {cmd}")
+    send_cmd(ser, "sf probe")
+    send_cmd(ser, f"sf erase {FLASH_ADDR} +{FLASH_SIZE}")
+    send_cmd(ser, f"sf write {LOAD_ADDR} {FLASH_ADDR} $filesize")
+    send_cmd(ser, "reset")
 
     ser.close()
-    log("\n✅ OPERACJA ZAKOŃCZONA SUKCESEM!")
-    log(f"Szczegóły operacji znajdziesz w pliku {LOG_FILE}")
+
+    print("\nFLASH ZAKOŃCZONY SUKCESEM ✅")
+
 
 if __name__ == "__main__":
     main()
