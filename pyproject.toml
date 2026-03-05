@@ -1,0 +1,8 @@
+[project]
+name = "logo-flash"
+version = "0.1.0"
+description = "Flash custom boot logo onto ORNO MD-1080 via U-Boot serial console"
+requires-python = ">=3.13"
+dependencies = [
+    "pyserial>=3.5",
+]

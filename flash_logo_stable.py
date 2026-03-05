@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import glob
+import shlex
 import shutil
 import serial
 import subprocess
@@ -90,9 +91,10 @@ def break_autoboot(ser):
 # ------------------------------------------------------------
 
 def convert_image(input_path, output_path, quality):
+    safe_input = input_path if not input_path.startswith("-") else "./" + input_path
     subprocess.run([
         "convert",
-        input_path,
+        safe_input,
         "-resize", f"{TARGET_RES[0]}x{TARGET_RES[1]}",
         "-background", "black",
         "-gravity", "center",
@@ -174,39 +176,53 @@ def main():
     # --- OTWIERAMY PORT ---
     ser = serial.Serial(port, BAUDRATE, timeout=1)
 
-    if not break_autoboot(ser):
-        print("Zresetuj urządzenie i spróbuj ponownie.")
-        sys.exit(1)
+    try:
+        if not break_autoboot(ser):
+            print("Zresetuj urządzenie i spróbuj ponownie.")
+            sys.exit(1)
 
-    send_cmd(ser, f"loady {LOAD_ADDR}")
+        send_cmd(ser, f"loady {LOAD_ADDR}")
 
-    print("Zamykam port do transferu YMODEM...")
-    ser.close()
-    time.sleep(0.5)
+        print("Zamykam port do transferu YMODEM...")
+        ser.close()
+        time.sleep(0.5)
 
-    # --- YMODEM ---
-    print("Start YMODEM (sb)...")
-    subprocess.run(
-        f"sb {output_file} < {port} > {port}",
-        shell=True,
-        check=True
-    )
+        # --- YMODEM ---
+        print("Start YMODEM (sb)...")
+        subprocess.run(
+            f"sb {shlex.quote(str(output_file))} < {shlex.quote(port)} > {shlex.quote(port)}",
+            shell=True,
+            check=True
+        )
 
-    # --- OTWIERAMY PONOWNIE ---
-    time.sleep(1)
-    ser = serial.Serial(port, BAUDRATE, timeout=1)
+        # --- OTWIERAMY PONOWNIE ---
+        time.sleep(1)
+        ser = serial.Serial(port, BAUDRATE, timeout=1)
 
-    print("Czekam na zakończenie transferu...")
-    wait_for(ser, "## Total Size", timeout=20)
+        print("Czekam na zakończenie transferu...")
+        if not wait_for(ser, "## Total Size", timeout=20):
+            print("Błąd: Nie otrzymano potwierdzenia transferu.")
+            sys.exit(1)
 
-    send_cmd(ser, "sf probe")
-    send_cmd(ser, f"sf erase {FLASH_ADDR} +{FLASH_SIZE}")
-    send_cmd(ser, f"sf write {LOAD_ADDR} {FLASH_ADDR} $filesize")
-    send_cmd(ser, "reset")
+        send_cmd(ser, "sf probe")
+        time.sleep(0.5)
 
-    ser.close()
+        send_cmd(ser, f"sf erase {FLASH_ADDR} +{FLASH_SIZE}")
+        if not wait_for(ser, "OK", timeout=10):
+            print("Błąd: sf erase nie powiodło się.")
+            sys.exit(1)
 
-    print("\nFLASH ZAKOŃCZONY SUKCESEM ✅")
+        send_cmd(ser, f"sf write {LOAD_ADDR} {FLASH_ADDR} $filesize")
+        if not wait_for(ser, "OK", timeout=10):
+            print("Błąd: sf write nie powiodło się.")
+            sys.exit(1)
+
+        send_cmd(ser, "reset")
+    finally:
+        if ser.is_open:
+            ser.close()
+
+    print("\nFLASH ZAKOŃCZONY SUKCESEM")
 
 
 if __name__ == "__main__":
