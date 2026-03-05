@@ -7,7 +7,6 @@ Skrypt konwertuje obraz wejściowy do JPEG o wymiarach 1024x600, dopełnia go do
 ## Wymagania
 
 - **Python 3.13+**
-- **ImageMagick** (`convert`) — konwersja i skalowanie obrazu
 - **lrzsz** (`sb`) — transfer YMODEM (tylko w trybie flash)
 - **uv** — zarządzanie zależnościami
 
